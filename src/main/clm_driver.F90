@@ -62,7 +62,6 @@ module clm_driver
   use ndepStreamMod          , only : ndep_interp
   use cropcalStreamMod       , only : cropcal_advance, cropcal_interp
   use ch4Mod                 , only : ch4, ch4_init_gridcell_balance_check, ch4_init_column_balance_check
-  use DUSTMod                , only : DustDryDep, DustEmission
   use VOCEmissionMod         , only : VOCEmission
   !
   use filterMod              , only : setFilters
@@ -111,10 +110,12 @@ contains
     ! the calling tree is given in the description of this module.
     !
     ! !USES:
-    use clm_time_manager     , only : get_curr_date
-    use clm_varctl           , only : use_lai_streams, fates_spitfire_mode
-    use laiStreamMod         , only : lai_advance
-    use FATESFireFactoryMod  , only : scalar_lightning
+    use clm_time_manager      , only : get_curr_date
+    use clm_varctl            , only : use_lai_streams, fates_spitfire_mode
+    use clm_varctl            , only : fates_seeddisp_cadence
+    use laiStreamMod          , only : lai_advance
+    use FATESFireFactoryMod   , only : scalar_lightning
+    use FatesInterfaceTypesMod, only : fates_dispersal_cadence_none
     !
     ! !ARGUMENTS:
     implicit none
@@ -225,7 +226,7 @@ contains
     ! Specified phenology
     ! Done in SP mode, FATES-SP mode and also when dry-deposition is active
     ! ============================================================================
-
+    
     if (use_cn) then
        ! For dry-deposition need to call CLMSP so that mlaidiff is obtained
        ! NOTE: This is also true of FATES below
@@ -264,7 +265,7 @@ contains
        end if
 
     end if
-
+    
     ! ==================================================================================
     ! Determine decomp vertical profiles
     !
@@ -468,13 +469,13 @@ contains
 
     ! When LAI streams are being used
     ! NOTE: This call needs to happen outside loops over nclumps (as streams are not threadsafe)
-    if ((.not. use_cn) .and. (.not. use_fates) .and. (doalb) .and. use_lai_streams) then
-       call lai_advance( bounds_proc )
+    if (doalb .and. use_lai_streams) then
+       call lai_advance(bounds_proc)
     endif
 
     ! When crop calendar streams are being used
     ! NOTE: This call needs to happen outside loops over nclumps (as streams are not threadsafe)
-    if (use_cropcal_streams .and. is_beg_curr_year()) then
+    if (use_crop .and. use_cropcal_streams .and. is_beg_curr_year()) then
       call cropcal_advance( bounds_proc )
     end if
 
@@ -509,7 +510,7 @@ contains
             atm_topo = atm2lnd_inst%forc_topo_grc(bounds_clump%begg:bounds_clump%endg))
 
        call downscale_forcings(bounds_clump, &
-            topo_inst, atm2lnd_inst, water_inst%wateratm2lndbulk_inst, &
+            topo_inst, atm2lnd_inst, surfalb_inst, water_inst%wateratm2lndbulk_inst, &
             eflx_sh_precip_conversion = energyflux_inst%eflx_sh_precip_conversion_col(bounds_clump%begc:bounds_clump%endc))
 
        call set_atm2lnd_water_tracers(bounds_clump, &
@@ -804,21 +805,21 @@ contains
        call t_startf('bgc')
 
        ! Dust mobilization (C. Zender's modified codes)
-       call DustEmission(bounds_clump,                                       &
+       call dust_emis_inst%DustEmission(bounds_clump,                                       &
             filter(nc)%num_nolakep, filter(nc)%nolakep,                      &
             atm2lnd_inst, soilstate_inst, canopystate_inst, &
             water_inst%waterstatebulk_inst, water_inst%waterdiagnosticbulk_inst, &
-            frictionvel_inst, dust_inst)
+            frictionvel_inst)
 
        ! Dust dry deposition (C. Zender's modified codes)
-       call DustDryDep(bounds_clump, &
-            atm2lnd_inst, frictionvel_inst, dust_inst)
+       call dust_emis_inst%DustDryDep(bounds_clump, &
+            atm2lnd_inst, frictionvel_inst)
 
-       ! VOC emission (A. Guenther's MEGAN (2006) model)
+       ! VOC emission (A. Guenther's MEGAN (2006) model; Wang et al., 2022, 2024a, 2024b)
        call VOCEmission(bounds_clump,                                         &
                filter(nc)%num_soilp, filter(nc)%soilp,                           &
                atm2lnd_inst, canopystate_inst, photosyns_inst, temperature_inst, &
-               vocemis_inst)
+               vocemis_inst, energyflux_inst)
 
        call t_stopf('bgc')
 
@@ -1072,11 +1073,12 @@ contains
             frictionvel_inst, photosyns_inst, drydepvel_inst)
        call t_stopf('depvel')
 
-       if (use_cropcal_streams .and. is_beg_curr_year()) then
+       if (use_crop .and. use_cropcal_streams .and. is_beg_curr_year()) then
           ! ============================================================================
           ! Update crop calendars
           ! ============================================================================
-          call cropcal_interp(bounds_clump, filter_inactive_and_active(nc)%num_pcropp, filter_inactive_and_active(nc)%pcropp, crop_inst)
+          call cropcal_interp(bounds_clump, filter_inactive_and_active(nc)%num_pcropp, &
+               filter_inactive_and_active(nc)%pcropp, .false., crop_inst)
        end if
 
        ! ============================================================================
@@ -1090,7 +1092,7 @@ contains
             filter(nc)%num_hydrologyc, filter(nc)%hydrologyc, &
             filter(nc)%num_urbanc, filter(nc)%urbanc,         &
             filter(nc)%num_do_smb_c, filter(nc)%do_smb_c,     &
-            atm2lnd_inst, glc2lnd_inst, temperature_inst,     &
+            glc2lnd_inst, temperature_inst,                   &
             soilhydrology_inst, soilstate_inst, water_inst%waterstatebulk_inst, &
             water_inst%waterdiagnosticbulk_inst, water_inst%waterbalancebulk_inst, &
             water_inst%waterfluxbulk_inst, water_inst%wateratm2lndbulk_inst, &
@@ -1267,6 +1269,14 @@ contains
     end do
     !$OMP END PARALLEL DO
 
+
+    ! Pass fates seed dispersal information to neighboring gridcells across
+    ! all MPI tasks.  Note that WrapGlobalSeedDispersal calls an MPI collective routine
+    ! and as such WrapGlobalSeedDispersal should be called outside of OMP threaded loop regions
+    if (use_fates) then
+       if (fates_seeddisp_cadence /= fates_dispersal_cadence_none) call clm_fates%WrapGlobalSeedDispersal()
+    end if
+
     ! ============================================================================
     ! Determine gridcell averaged properties to send to atm
     ! ============================================================================
@@ -1298,7 +1308,7 @@ contains
          atm2lnd_inst, surfalb_inst, temperature_inst, frictionvel_inst, &
          water_inst, &
          energyflux_inst, solarabs_inst, drydepvel_inst,       &
-         vocemis_inst, fireemis_inst, dust_inst, ch4_inst, glc_behavior, &
+         vocemis_inst, fireemis_inst, dust_emis_inst, ch4_inst, glc_behavior, &
          lnd2atm_inst, &
          net_carbon_exchange_grc = net_carbon_exchange_grc(bounds_proc%begg:bounds_proc%endg))
     deallocate(net_carbon_exchange_grc)
@@ -1363,7 +1373,7 @@ contains
 
        call atm2lnd_inst%UpdateAccVars(bounds_proc)
 
-       call temperature_inst%UpdateAccVars(bounds_proc)
+       call temperature_inst%UpdateAccVars(bounds_proc, crop_inst)
 
        call canopystate_inst%UpdateAccVars(bounds_proc)
 
